@@ -1,7 +1,13 @@
-extern crate mio;
 
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
+extern crate fern;
+extern crate time;
+
+extern crate mio;
 extern crate env_logger;
+
+use log::*;
 
 use std::io;
 use std::io::{Error, ErrorKind};
@@ -16,11 +22,26 @@ use mio::util::Slab;
 
 const HOST: &'static str = "0.0.0.0:10001";
 
+
+
+
 fn start_server() {
     // Before doing anything, let us register a logger. The mio library has really good logging
     // at the _trace_ and _debug_ levels. Having a logger setup is invaluable when trying to
     // figure out why something is not working correctly.
-    env_logger::init().ok().expect("Failed to init logger");
+    let logger_config = fern::DispatchConfig {
+        format: Box::new(|msg: &str, level: &log::LogLevel, _location: &log::LogLocation| {
+            // This is a fairly simple format, though it's possible to do more complicated ones.
+            // This closure can contain any code, as long as it produces a String message.
+            format!("[{}] - {} - {}", time::now().strftime("%Y-%m-%d:%H:%M:%S").unwrap(), level, msg)
+         }),
+        output: vec![fern::OutputConfig::stdout(), fern::OutputConfig::file("output.log")],
+        level: log::LogLevelFilter::Trace,
+    };
+    if let Err(e) = fern::init_global_logger(logger_config, log::LogLevelFilter::Trace) {
+        panic!("Failed to initialize global logger: {}", e);
+    }
+    //env_logger::init().ok().expect("Failed to init logger");
 
     let addr: SocketAddr = FromStr::from_str(HOST)
         .ok().expect("Failed to parse host:port string");
