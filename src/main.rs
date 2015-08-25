@@ -1,199 +1,347 @@
+extern crate mio;
 
 #[macro_use] extern crate log;
 extern crate env_logger;
-extern crate mio;
-extern crate sha1;
-extern crate rustc_serialize;
-
-
 
 use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::collections::HashMap;
 
 use mio::*;
-use mio::tcp::{TcpListener,TcpStream};
 use mio::buf::ByteBuf;
+use mio::tcp::*;
 use mio::util::Slab;
 
 
-use self::rustc_serialize::base64::{ToBase64, STANDARD};
+const HOST: &'static str = "0.0.0.0:10001";
 
-const MAGIC_WS: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const SERVER: Token = Token(0);
-const HOST: &'static str = "127.0.0.1:10001";
-const HEADER_KEY_VALUE_TRIMMERS: &'static[char] = &[':'];
-const CHARS_TO_TRIM: &'static[char] = &[' ', '\r', '\n'];
-const UPGRADE: &'static [u8;9] = b"websocket";
-const CONNECTION: &'static [u8;7] = b"Upgrade";
+fn start_server() {
+    // Before doing anything, let us register a logger. The mio library has really good logging
+    // at the _trace_ and _debug_ levels. Having a logger setup is invaluable when trying to
+    // figure out why something is not working correctly.
+    env_logger::init().ok().expect("Failed to init logger");
 
-static CR: u8 = b'\r';
-static LF: u8 = b'\n';
-static COLON: u8 = b':';
-static SPACE: u8 = b' ';
-static SLASH: u8 = b'/';
-static HEAD_KEY: &'static [u8;17] = b"Sec-WebSocket-Key";
+    let addr: SocketAddr = FromStr::from_str(HOST)
+        .ok().expect("Failed to parse host:port string");
+    let sock = TcpListener::bind(&addr).ok().expect("Failed to bind address");
 
+    let mut event_loop = EventLoop::new().ok().expect("Failed to create event loop");
 
-fn gen_key(key: &String) -> String {
-	println!("Socket string:{}",key);
-	let mut m = sha1::Sha1::new();
-	let mut buf = [0u8;20];
+    // Create our Server object and register that with the event loop. I am hiding away
+    // the details of how registering works inside of the `Server#register` function. One reason I
+    // really like this is to get around having to have `const SERVER = Token(0)` at the top of my
+    // file. It also keeps our polling options inside `Server`.
+    let mut server = Server::new(sock);
+    server.register(&mut event_loop).ok().expect("Failed to register server with event loop");
 
-	m.update(key.as_bytes());
-	m.update(MAGIC_WS.as_bytes());
-
-	m.output(&mut buf);
-
-	return buf.to_base64(STANDARD);
+    info!("Even loop starting...");
+    event_loop.run(&mut server).ok().expect("Failed to start event loop");
 }
 
-#[derive(Debug)]
-#[derive(PartialEq)]
-enum ClienState {
-    AwaitingHandshake,
-    HandshakeResponse,
-    Connected
+fn main() {
+    start_server()
+
 }
 
-#[derive(Debug)]
+
 struct Server {
+    // main socket for our server
     sock: TcpListener,
+
+    // token of our server. we keep track of it here instead of doing `const SERVER = Token(0)`.
     token: Token,
-    socks: Slab<Client>
+
+    // a list of connections _accepted_ by our server
+    conns: Slab<Connection>,
+
 }
 
-struct Client{
-    sock: TcpStream,
-    token: Token,
-    interest: EventSet,
-    state: ClienState,
-    header: Header,
-    send_queue: Vec<ByteBuf>
-}
+impl Handler for Server {
+    type Timeout = ();
+    type Message = ();
 
-#[derive(Debug)]
-struct Header {
-    method: String,
-    uri: String,
-    http_version: String,
-    fields: HashMap<String,String>
-}
+    fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
+        debug!("events = {:?}", events);
+        assert!(token != Token(0), "[BUG]: Received event for Token(0)");
 
-impl Header {
-    fn new() -> Header {
-        Header{method: String::new(),uri: String::new(),http_version: String::new(),fields: HashMap::new()}
-    }
-}
-struct Parser;
+        if events.is_error() {
+            warn!("Error event for {:?}", token);
+            self.reset_connection(event_loop, token);
+            return;
+        }
 
-impl Parser {
-    fn new() -> Parser {
-        Parser
-    }
-    fn parser (&self, body: &[u8], h: &mut Header){
-        let _h = body.split(|x| *x==10).collect::<Vec<_>>();
-        let it = &mut  _h.iter();
-        let first_row = self.first_row(it.next().unwrap());
-        h.method = first_row.0;
-        h.uri = first_row.1;
-        h.http_version = first_row.3;
-        self.headers(it,h);
-    }
-    //fn first_row(&self,buf: &[u8]) -> (Method, Uri, Http, HttpVersion) {
-    fn first_row(&self,buf: &[u8]) -> (String, String, String, String) {
-        println!("In first row: {:?}", std::str::from_utf8(buf));
-        let h = buf.split(|x| *x == SPACE).collect::<Vec<_>>();
-        println!("Vec : {:?}", h);
-        let it = &mut h.iter();
-        let method = "Get".to_string();
-        it.next();
-        let uri = std::str::from_utf8(it.next().unwrap()).unwrap().to_string();
-        let http = "http".to_string();
-        let http_version = "1.1".to_string();
-        /*let method = match it.next() {
-            Some(&v) => match v.iter().fold(0, |acc, &x| acc + x) {
-                            224 => Method::Get,
-                            _ => Method::Missing
-                        },
-            None => Method::Missing
-        };
-        let uri: Uri = match it.next() {
-            Some(&v) => Uri::Valid(std::str::from_utf8(v).unwrap().to_string()),
-            None => Uri::Missing
-        };
-        let http = Http::Htt;
-        let http_version = HttpVersion::Version(1.1);
-        */
-        println!("Method: {:?} - {:?} - {:?} - {:?}", method, uri, http, http_version);
-        (method, uri, http, http_version)
-    }
+        if events.is_hup() {
+            trace!("Hup event for {:?}", token);
+            self.reset_connection(event_loop, token);
+            return;
+        }
 
-    fn headers(&self,it: &mut std::slice::Iter<&[u8]>, h: &mut Header){
-        for i in it {
-            let mut s = i.split(|x| *x == SPACE );
-            let k = match s.next(){
-                Some(mut v) => std::str::from_utf8(v).unwrap().to_string().trim().replace(":",""),
-                None => "".to_string()
-            };
-            let v = match s.next(){
-                Some(mut v) => std::str::from_utf8(v).unwrap().to_string().trim().to_string(),
-                None => "".to_string()
-            };
-            println!("{} - {}",k,v);
-            h.fields.insert(k,v);
+        // We never expect a write event for our `Server` token . A write event for any other token
+        // should be handed off to that connection.
+        if events.is_writable() {
+            trace!("Write event for {:?}", token);
+            assert!(self.token != token, "Received writable event for Server");
+
+            self.find_connection_by_token(token).writable()
+                .and_then(|_| self.find_connection_by_token(token).reregister(event_loop))
+                .unwrap_or_else(|e| {
+                    warn!("Write event failed for {:?}, {:?}", token, e);
+                    self.reset_connection(event_loop, token);
+                });
+        }
+
+        // A read event for our `Server` token means we are establishing a new connection. A read
+        // event for any other token should be handed off to that connection.
+        if events.is_readable() {
+            trace!("Read event for {:?}", token);
+            if self.token == token {
+                self.accept(event_loop);
+            } else {
+
+                self.readable(event_loop, token)
+                    .and_then(|_| self.find_connection_by_token(token).reregister(event_loop))
+                    .unwrap_or_else(|e| {
+                        warn!("Read event failed for {:?}: {:?}", token, e);
+                        self.reset_connection(event_loop, token);
+                    });
+            }
         }
     }
 }
 
-impl Client{
-    fn new(sock: TcpStream, token: Token) -> Client{
-        Client{
+impl Server {
+    fn new(sock: TcpListener) -> Server {
+        Server {
             sock: sock,
-            token: token,
-            interest: EventSet::readable(),
-            state: ClienState::AwaitingHandshake,
-            header: Header::new(),
-            send_queue: Vec::new()
+
+            // I don't use Token(0) because kqueue will send stuff to Token(0)
+            // by default causing really strange behavior. This way, if I see
+            // something as Token(0), I know there are kqueue shenanigans
+            // going on.
+            token: Token(1),
+
+            // SERVER is Token(1), so start after that
+            // we can deal with a max of 126 connections
+            conns: Slab::new_starting_at(Token(2), 128)
         }
     }
 
-    fn register(&mut self, ev_loop: &mut EventLoop<Server>) -> std::io::Result<()> {
-        self.interest.insert(EventSet::readable());
-
-        ev_loop.register_opt(&self.sock, self.token, self.interest
-                                , PollOpt::edge() | PollOpt::oneshot()).or_else(|e| {
-                                    error!("Failed to reregister {:?}, {:?}", self.token, e);
-                                    Err(e)
-                                    })
-    }
-
-    fn reregister(&mut self, ev_loop: &mut EventLoop<Server>) -> std::io::Result<()> {
-        ev_loop.reregister(
+    /// Register Server with the event loop.
+    ///
+    /// This keeps the registration details neatly tucked away inside of our implementation.
+    fn register(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+        event_loop.register_opt(
             &self.sock,
             self.token,
-            self.interest,
-            PollOpt::edge() | PollOpt::oneshot())
-        .or_else(|e| {
-                error!("Failed to reregister {:?}, {:?}", self.token, e);
-                Err(e)
+            EventSet::readable(),
+            PollOpt::edge() | PollOpt::oneshot()
+        ).or_else(|e| {
+            error!("Failed to register server {:?}, {:?}", self.token, e);
+            Err(e)
         })
     }
 
-    fn readable(&mut self) -> std::io::Result<ByteBuf> {
-        let mut buf = ByteBuf::mut_with_capacity(2048);
+    /// Register Server with the event loop.
+    ///
+    /// This keeps the registration details neatly tucked away inside of our implementation.
+    fn reregister(&mut self, event_loop: &mut EventLoop<Server>) {
+        event_loop.reregister(
+            &self.sock,
+            self.token,
+            EventSet::readable(),
+            PollOpt::edge() | PollOpt::oneshot()
+        ).unwrap_or_else(|e| {
+            error!("Failed to reregister server {:?}, {:?}", self.token, e);
+            let server_token = self.token;
+            self.reset_connection(event_loop, server_token);
+        })
+    }
 
+    /// Accept a _new_ client connection.
+    ///
+    /// The server will keep track of the new connection and forward any events from the event loop
+    /// to this connection.
+    fn accept(&mut self, event_loop: &mut EventLoop<Server>) {
+        debug!("server accepting new socket");
+
+        // Log an error if there is no socket, but otherwise move on so we do not tear down the
+        // entire server.
+        let sock = match self.sock.accept() {
+            Ok(s) => {
+                match s {
+                    Some(sock) => sock,
+                    None => {
+                        error!("Failed to accept new socket");
+                        self.reregister(event_loop);
+                        return;
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Failed to accept new socket, {:?}", e);
+                self.reregister(event_loop);
+                return;
+            }
+        };
+
+        // `Slab#insert_with` is a wrapper around `Slab#insert`. I like `#insert_with` because I
+        // make the `Token` required for creating a new connection.
+        //
+        // `Slab#insert` returns the index where the connection was inserted. Remember that in mio,
+        // the Slab is actually defined as `pub type Slab<T> = ::slab::Slab<T, ::Token>;`. Token is
+        // just a tuple struct around `usize` and Token implemented `::slab::Index` trait. So,
+        // every insert into the connection slab will return a new token needed to register with
+        // the event loop. Fancy...
+        match self.conns.insert_with(|token| {
+            debug!("registering {:?} with event loop", token);
+            Connection::new(sock, token)
+        }) {
+            Some(token) => {
+                // If we successfully insert, then register our connection.
+                match self.find_connection_by_token(token).register(event_loop) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        error!("Failed to register {:?} connection with event loop, {:?}", token, e);
+                        self.conns.remove(token);
+                    }
+                }
+            },
+            None => {
+                // If we fail to insert, `conn` will go out of scope and be dropped.
+                error!("Failed to insert connection into slab");
+            }
+        };
+
+        // We are using edge-triggered polling. Even our SERVER token needs to reregister.
+        self.reregister(event_loop);
+    }
+
+    /// Forward a readable event to an established connection.
+    ///
+    /// Connections are identified by the token provided to us from the event loop. Once a read has
+    /// finished, push the receive buffer into the all the existing connections so we can
+    /// broadcast.
+    fn readable(&mut self, event_loop: &mut EventLoop<Server>, token: Token) -> io::Result<()> {
+        debug!("server conn readable; token={:?}", token);
+        let message = try!(self.find_connection_by_token(token).readable());
+
+        if message.remaining() == message.capacity() { // is_empty
+            return Ok(());
+        }
+
+        // TODO pipeine this whole thing
+        let mut bad_tokens = Vec::new();
+
+        // Queue up a write for all connected clients.
+        for conn in self.conns.iter_mut() {
+            // TODO: use references so we don't have to clone
+            let conn_send_buf = ByteBuf::from_slice(message.bytes());
+            conn.send_message(conn_send_buf)
+                .and_then(|_| conn.reregister(event_loop))
+                .unwrap_or_else(|e| {
+                    error!("Failed to queue message for {:?}: {:?}", conn.token, e);
+                    // We have a mutable borrow for the connection, so we cannot remove until the
+                    // loop is finished
+                    bad_tokens.push(conn.token)
+                });
+        }
+
+        for t in bad_tokens {
+            self.reset_connection(event_loop, t);
+        }
+
+        Ok(())
+    }
+
+    fn reset_connection(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+        if self.token == token {
+            event_loop.shutdown();
+        } else {
+            debug!("reset connection; token={:?}", token);
+            self.conns.remove(token);
+        }
+    }
+
+    /// Find a connection in the slab using the given token.
+    fn find_connection_by_token<'a>(&'a mut self, token: Token) -> &'a mut Connection {
+        &mut self.conns[token]
+    }
+}
+
+/// A stateful wrapper around a non-blocking stream. This connection is not
+/// the SERVER connection. This connection represents the client connections
+/// _accepted_ by the SERVER connection.
+struct Connection {
+    // handle to the accepted socket
+    sock: TcpStream,
+
+    // token used to register with the event loop
+    token: Token,
+
+    // set of events we are interested in
+    interest: EventSet,
+
+    // messages waiting to be sent out
+    send_queue: Vec<ByteBuf>,
+}
+
+impl Connection {
+    fn new(sock: TcpStream, token: Token) -> Connection {
+        Connection {
+            sock: sock,
+            token: token,
+
+            // new connections are only listening for a hang up event when
+            // they are first created. we always want to make sure we are
+            // listening for the hang up event. we will additionally listen
+            // for readable and writable events later on.
+            interest: EventSet::hup(),
+
+            send_queue: Vec::new(),
+        }
+    }
+
+    /// Handle read event from event loop.
+    ///
+    /// Currently only reads a max of 2048 bytes. Excess bytes are dropped on the floor.
+    ///
+    /// The recieve buffer is sent back to `Server` so the message can be broadcast to all
+    /// listening connections.
+    fn readable(&mut self) -> io::Result<ByteBuf> {
+
+        // ByteBuf is a heap allocated slice that mio supports internally. We use this as it does
+        // the work of tracking how much of our slice has been used. I chose a capacity of 2048
+        // after reading
+        // https://github.com/carllerche/mio/blob/eed4855c627892b88f7ca68d3283cbc708a1c2b3/src/io.rs#L23-27
+        // as that seems like a good size of streaming. If you are wondering what the difference
+        // between messaged based and continuous streaming read
+        // http://stackoverflow.com/questions/3017633/difference-between-message-oriented-protocols-and-stream-oriented-protocols
+        // . TLDR: UDP vs TCP. We are using TCP.
+        let mut recv_buf = ByteBuf::mut_with_capacity(2048);
+
+        // we are PollOpt::edge() and PollOpt::oneshot(), so we _must_ drain
+        // the entire socket receive buffer, otherwise the server will hang.
         loop {
-            match self.sock.try_read_buf(&mut buf) {
+            match self.sock.try_read_buf(&mut recv_buf) {
+                // the socket receive buffer is empty, so let's move on
+                // try_read_buf internally handles WouldBlock here too
                 Ok(None) => {
                     debug!("CONN : we read 0 bytes");
                     break;
                 },
                 Ok(Some(n)) => {
                     debug!("CONN : we read {} bytes", n);
-                    if n < buf.capacity() {
+
+                    // if we read less than capacity, then we know the
+                    // socket is empty and we should stop reading. if we
+                    // read to full capacity, we need to keep reading so we
+                    // can drain the socket. if the client sent exactly capacity,
+                    // we will match the arm above. the recieve buffer will be
+                    // full, so extra bytes are being dropped on the floor. to
+                    // properly handle this, i would need to push the data into
+                    // a growable Vec<u8>.
+                    if n < recv_buf.capacity() {
                         break;
                     }
                 },
@@ -203,296 +351,140 @@ impl Client{
                 }
             }
         }
-        Ok(buf.flip())
+
+        // change our type from MutByteBuf to ByteBuf
+        Ok(recv_buf.flip())
     }
 
+    /// Handle a writable event from the event loop.
+    ///
+    /// Send one message from the send queue to the client. If the queue is empty, remove interest
+    /// in write events.
+    /// TODO: Figure out if sending more than one message is optimal. Maybe we should be trying to
+    /// flush until the kernel sends back EAGAIN?
     fn writable(&mut self) -> io::Result<()> {
+
         try!(self.send_queue.pop()
-                    .ok_or(Error::new(ErrorKind::Other, "Could not pop send queue"))
-                    .and_then(|mut buf| {
-                        match self.sock.try_write_buf(&mut buf) {
-                            Ok(None) => {
-                                debug!("client flushing buf; WouldBlock");
+            .ok_or(Error::new(ErrorKind::Other, "Could not pop send queue"))
+            .and_then(|mut buf| {
+                match self.sock.try_write_buf(&mut buf) {
+                    Ok(None) => {
+                        debug!("client flushing buf; WouldBlock");
 
-                                // put message back into the queue so we can try again
-                                self.send_queue.push(buf);
-                                Ok(())
-                            },
-                            Ok(Some(n)) => {
-                                debug!("CONN : we wrote {} bytes", n);
-                                Ok(())
-                            },
-                            Err(e) => {
-                                error!("Failed to send buffer for {:?}, error: {}", self.token, e);
-                                Err(e)
-                            }
-                        }
-                    })
-                );
+                        // put message back into the queue so we can try again
+                        self.send_queue.push(buf);
+                        Ok(())
+                    },
+                    Ok(Some(n)) => {
+                        debug!("CONN : we wrote {} bytes", n);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        error!("Failed to send buffer for {:?}, error: {}", self.token, e);
+                        Err(e)
+                    }
+                }
+            })
+        );
 
-                /*if self.send_queue.is_empty() {
-                    self.interest.remove(EventSet::writable());
-                }*/
-                Ok(())
-    }
-
-    fn writable_handshake(&mut self) -> io::Result<()> {
-        let key = match self.header.fields.get("Sec-WebSocket-Key") {
-            Some(v) => gen_key(v),
-            _ => panic!("No key")
-        };
-
-        let buf = format!("HTTP/1.1 101 Switching Protocols\r\n\
-        Upgrade: websocket\r\n\
-        Connection: Upgrade\r\n\
-        Sec-WebSocket-Accept: {}\r\n\
-        Sec-WebSocket-Version: 13\r\n\r\n",key);
-
-        match self.sock.try_write_buf(&mut ByteBuf::from_slice(buf.as_bytes())) {
-            Ok(None) => {
-                debug!("client flushing buf; WouldBlock");
-                self.interest.remove(EventSet::writable());
-                // put message back into the queue so we can try again
-                Ok(())
-            },
-            Ok(Some(n)) => {
-                debug!("CONN : we wrote {} bytes", n);
-                self.interest.remove(EventSet::writable());
-                Ok(())
-            },
-            Err(e) => {
-                self.interest.remove(EventSet::writable());
-                error!("Failed to send buffer for {:?}, error: {}", self.token, e);
-                Err(e)
-            }
+        if self.send_queue.is_empty() {
+            self.interest.remove(EventSet::writable());
         }
+
+        Ok(())
     }
 
-    fn send_message(&mut self, msg: ByteBuf) -> std::io::Result<()> {
-        self.send_queue.push(msg);
+    /// Queue an outgoing message to the client.
+    ///
+    /// This will cause the connection to register interests in write events with the event loop.
+    /// The connection can still safely have an interest in read events. The read and write buffers
+    /// operate independently of each other.
+    fn send_message(&mut self, message: ByteBuf) -> io::Result<()> {
+        self.send_queue.push(message);
         self.interest.insert(EventSet::writable());
         Ok(())
     }
 
-    fn is_connected(&mut self) -> bool {
-        match self.state {
-            ClienState::Connected => true,
-            _ => false
-        }
-    }
+    /// Register interest in read events with the event_loop.
+    ///
+    /// This will let our connection accept reads starting next event loop tick.
+    fn register(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+        self.interest.insert(EventSet::readable());
 
-    fn parse_header(&mut self) -> std::io::Result<()>{
-        let msg = try!(self.readable());
-        debug!("{:?}",std::str::from_utf8(msg.bytes()).unwrap().to_string());
-        Parser::new().parser(msg.bytes(),&mut self.header);
-        Ok(())
-    }
-}
-
-impl Server {
-    fn new(sock: TcpListener) -> Server{
-        Server{sock: sock,token: Token(0), socks: Slab::new_starting_at(Token(2),128)}
-    }
-
-    fn accept(&mut self,ev_loop: &mut EventLoop<Server>){
-        let sock = match self.sock.accept() {
-            Ok(s) => match s {
-                Some(sock) => sock,
-                None => {
-                    error!("Failed to accept new socket");
-                    self.reregister(ev_loop);
-                    return;
-                }
-            },
-            Err(e) => {
-                error!("Failed to accept new socket {:?}",e);
-                self.reregister(ev_loop);
-                return;
-            }
-        };
-
-        match self.socks.insert_with(
-                |token| {
-                    debug!("Registring new connection");
-                    Client::new(sock, token)
-                }
-            ){
-                Some(token) => {
-                    match self.find_connection_by_token(token).register(ev_loop){
-                        Ok(_) => info!("New connection registred"),
-                        Err(e) => {
-                            error!("Failed to register {:?} connection with event loop, {:?}", token, e);
-                            self.socks.remove(token);
-                        }
-                    }
-                },
-                None => {error!("Failed to insert connection into slab");
-            }
-        };
-        self.reregister(ev_loop);
-    }
-
-    fn read_handshake(&mut self, ev_loop: &mut EventLoop<Server>, token: Token) -> std::io::Result<()> {
-        debug!("server handshake readable; token={:?}", token);
-        let client = self.find_connection_by_token(token);
-        client.parse_header();
-
-        client.interest.insert(EventSet::writable());
-        client.reregister(ev_loop);
-
-       //debug!("header: {:?}",std::str::from_utf8(msg.bytes()).unwrap().to_string());
-       Ok(())
-    }
-
-    fn readable(&mut self, ev_loop: &mut EventLoop<Server>, token: Token) -> std::io::Result<()> {
-         debug!("server conn readable; token={:?}", token);
-
-        let msg = try!(self.find_connection_by_token(token).readable());
-
-        if msg.remaining() == msg.capacity() {
-            return Ok(());
-        }
-
-        let mut bad_tokens = Vec::new();
-
-        for client in self.socks.iter_mut(){
-            let buf = ByteBuf::from_slice(msg.bytes());
-            //let buf = msg;
-            client.send_message(buf)
-                .and_then(|_| {
-                        client.reregister(ev_loop)
-                }).unwrap_or_else(|e| {
-                    error!("Failed to queue message for {:?}: {:?}", client.token, e);
-                    bad_tokens.push(client.token)
-                });
-        }
-        Ok(())
-    }
-
-    fn register(&self, ev_loop: &mut EventLoop<Server>) -> std::io::Result<()> {
-        ev_loop.register_opt(&self.sock,self.token,EventSet::readable()
-            ,PollOpt::edge() | PollOpt::oneshot()).or_else( |e| {
-                error!("Failed to register server connection with event loop, {:?}", e);
-                Err(e)
-            })
-    }
-
-    fn reregister(&mut self, ev_loop:&mut EventLoop<Server>){
-        ev_loop.reregister(
+        event_loop.register_opt(
             &self.sock,
             self.token,
-            EventSet::readable(),
-            PollOpt::edge() | PollOpt::oneshot())
-            .unwrap_or_else(|e| {
-                error!("Failed to reregister server {:?}, {:?}", self.token, e);
-                let server_token = self.token;
-                self.reset_connection(ev_loop, server_token);
-            });
+            self.interest,
+            PollOpt::edge() | PollOpt::oneshot()
+        ).or_else(|e| {
+            error!("Failed to reregister {:?}, {:?}", self.token, e);
+            Err(e)
+        })
     }
 
-    fn find_connection_by_token(&mut self,token: Token) -> &mut Client{
-        &mut self.socks[token]
-    }
-
-    fn reset_connection(&mut self,ev_loop: &mut EventLoop<Server>, token: Token){
-        if self.token == token {
-            ev_loop.shutdown();
-        }else{
-            debug!("reset connection; token={:?}", token);
-            self.socks.remove(token);
-        }
+    /// Re-register interest in read events with the event_loop.
+    fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+        event_loop.reregister(
+            &self.sock,
+            self.token,
+            self.interest,
+            PollOpt::edge() | PollOpt::oneshot()
+        ).or_else(|e| {
+            error!("Failed to reregister {:?}, {:?}", self.token, e);
+            Err(e)
+        })
     }
 }
 
-impl Handler for Server {
-    type Timeout = u32;
-    type Message = String;
-    fn ready(&mut self, ev_loop: &mut EventLoop<Server>, token: Token, events: EventSet){
-        if(events.is_writable()){
-            debug!("Writable");
-            let connected = self.find_connection_by_token(token).is_connected();
-            if connected {
-                trace!("Write event for {:?}", token);
-                assert!(self.token != token, "Received writable event for Server");
-                self.find_connection_by_token(token).writable()
-                                .and_then(|_| self.find_connection_by_token(token).reregister(ev_loop))
-                                .unwrap_or_else(|e| {
-                                    warn!("Write event failed for {:?}, {:?}", token, e);
-                                    self.reset_connection(ev_loop, token);
-                                });
-            }else{
-                trace!("Write event for {:?}", token);
-                assert!(self.token != token, "Received writable event for Server");
-                self.find_connection_by_token(token).writable_handshake()
-                                .and_then(|_| self.find_connection_by_token(token).reregister(ev_loop))
-                                .unwrap_or_else(|e| {
-                                    warn!("Write event failed for {:?}, {:?}", token, e);
-                                    self.reset_connection(ev_loop, token);
-                                });
-            }
-        }
+#[cfg(test)]
+mod Test {
+    use super::{start_server,HOST};
+    use std::io::prelude::*;
+    use std::net::TcpStream;
+    use std::thread;
+    use std::str;
 
-        if events.is_readable() {
-            if self.token == token {
-                self.accept(ev_loop);
-            } else {
-                let connected = self.find_connection_by_token(token).is_connected();
-                if connected {
-                    self.readable(ev_loop,token).and_then(|_|
-                        {
-                            self.find_connection_by_token(token).reregister(ev_loop)
-                        }).unwrap_or_else(|e| {
-                            warn!("Read event failed for {:?}: {:?}", token, e);
-                            self.reset_connection(ev_loop, token);
-                        });
-                }else{
-                    self.read_handshake(ev_loop,token);
-                }
-                /*match client.state {
-                    ClienState::AwaitingHandshake => {
-                        self.handshake(ev_loop,token);
-                    },
-                    _ => {
-                        self.readable(ev_loop,token).and_then(|_|
-                            {
-                                self.find_connection_by_token(token).reregister(ev_loop)
-                            }).unwrap_or_else(|e| {
-                                warn!("Read event failed for {:?}: {:?}", token, e);
-                                self.reset_connection(ev_loop, token);
-                            });
+    #[test]
+    fn start() {
+        thread::spawn(move || {start_server();}).join();
+    }
+
+    #[test]
+    fn client(){
+        thread::sleep_ms(3000);
+
+        for i in 0..10 {
+
+            let _ = thread::spawn(move|| {
+
+                let mut stream = TcpStream::connect(HOST).unwrap();
+
+                for x in 0..100 {
+                    write!(stream, "the answer is {}", i).unwrap();
+
+                    let mut r = [0u8; 256];
+                    match stream.read(&mut r) {
+                        Ok(0) => {
+                            debug!("thread {}: 0 bytes read", i+x);
+                        },
+                        Ok(n) => {
+                            debug!("thread {}: {} bytes read", i+x, n);
+
+                            let s = str::from_utf8(&r[..]).unwrap();
+                            debug!("thread {} read = {}", i+x, s);
+                        },
+                        Err(e) => {
+                            debug!("thread {}: {}", i+x, e);
                         }
-                    }*/
-            }
+                    }
+                }
+            });
         }
-    }
-    fn notify(&mut self, ev_loop: &mut EventLoop<Server>, msg: String){
-        println!("Message: {}",msg);
-        //ev_loop.shutdown();
+
     }
 
-    fn timeout(&mut self, ev_loop: &mut EventLoop<Server>, timeout: u32){
-        println!("Timeout: {}",timeout);
-        ev_loop.shutdown();
+    fn write(stream: &mut TcpStream) {
+        stream.write("pipopo".as_bytes());
     }
-}
 
-fn main(){
-    env_logger::init().ok().expect("Failed to init log");
-
-    let addr: SocketAddr = FromStr::from_str("127.0.0.1:10001")
-        .ok().expect("Failed to parse host:port string");
-
-    let sock = TcpListener::bind(&addr).ok().expect("Failed to bind address");
-
-    let mut ev_loop: EventLoop<Server> = EventLoop::new().ok().expect("Failed to create event loop");
-
-
-    let mut server = Server::new(sock);
-
-    server.register(&mut ev_loop).ok().expect("Failed to register server with event loop");
-
-    ev_loop.timeout_ms(121,121000).ok().expect("Failed to set timeout to 121 seconds");
-
-    info!("Even loop starting...");
-    ev_loop.run(&mut server).ok().expect("Failed to start event loop");
 }
