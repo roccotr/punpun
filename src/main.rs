@@ -8,6 +8,7 @@ extern crate mio;
 extern crate rmp;
 extern crate rmp_serialize;
 extern crate rustc_serialize;
+use std::collections::BTreeMap;
 
 use log::*;
 
@@ -24,32 +25,41 @@ use mio::util::Slab;
 use rustc_serialize::{Encodable,Decodable};
 use rmp_serialize::{Encoder,Decoder};
 
+use std::rc::Rc;
 
-const HOST: &'static str = "0.0.0.0:10001";
+
 
 #[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
 struct Message {
-    ch: String,
-    msg: String,
-    time: String
+    action: String,
+    channel: String,
+    message: String,
+    time: String,
 }
 
+const HOST: &'static str = "0.0.0.0:10001";
+const LOG_LEVEL: log::LogLevelFilter = log::LogLevelFilter::Debug;
+const LOG_FILE_NAME: &'static str = "/Users/sommoyogurt/workspace/rust/punpun/logs/debug.log";
+const SERVER: Token = Token(1);
 
 
-
-fn start_server() {
+fn init_logger() -> std::io::Result<()> {
 
     let logger_config = fern::DispatchConfig {
         format: Box::new(|msg: &str, level: &log::LogLevel, _location: &log::LogLocation| {
             format!("[{}] - {} - {}", time::now().strftime("%Y-%m-%d:%H:%M:%S").unwrap(), level, msg)
          }),
-        output: vec![fern::OutputConfig::stdout(), fern::OutputConfig::file("output.log")],
-        level: log::LogLevelFilter::Debug,
+        output: vec![fern::OutputConfig::stdout(), fern::OutputConfig::file(LOG_FILE_NAME)],
+        level: LOG_LEVEL,
     };
-    if let Err(e) = fern::init_global_logger(logger_config, log::LogLevelFilter::Debug) {
+    if let Err(e) = fern::init_global_logger(logger_config, LOG_LEVEL) {
         panic!("Failed to initialize global logger: {}", e);
     }
-    //env_logger::init().ok().expect("Failed to init logger");
+    Ok(())
+}
+
+
+fn start_server() {
 
     let addr: SocketAddr = FromStr::from_str(HOST)
         .ok().expect("Failed to parse host:port string");
@@ -65,15 +75,19 @@ fn start_server() {
 }
 
 fn main() {
-    start_server()
-
+    match init_logger(){
+        Ok(s) => info!("Logger init"),
+        Err(e) => error!("Error init logger")
+    }
+    start_server();
 }
 
 
 struct Server {
     sock: TcpListener,
     token: Token,
-    conns: Slab<Connection>,
+    conns: Slab<Rc<Connection>>,
+    tree: BTreeMap<String,Vec<Rc<Connection>>>,
 }
 
 impl Handler for Server {
@@ -100,7 +114,7 @@ impl Handler for Server {
             trace!("Write event for {:?}", token);
             assert!(self.token != token, "Received writable event for Server");
 
-            self.find_connection_by_token(token).writable()
+            self.find_connection_by_token(token).unwrap().writable()
                 .and_then(|_| self.find_connection_by_token(token).reregister(event_loop))
                 .unwrap_or_else(|e| {
                     warn!("Write event failed for {:?}, {:?}", token, e);
@@ -129,7 +143,8 @@ impl Server {
         Server {
             sock: sock,
             token: Token(1),
-            conns: Slab::new_starting_at(Token(2), 128)
+            conns: Slab::new_starting_at(Token(2), 128),
+            tree: BTreeMap::new()
         }
     }
 
@@ -181,7 +196,7 @@ impl Server {
 
         match self.conns.insert_with(|token| {
             debug!("registering {:?} with event loop", token);
-            Connection::new(sock, token)
+            Rc::new(Connection::new(sock, token))
         }) {
             Some(token) => {
                 match self.find_connection_by_token(token).register(event_loop) {
@@ -201,11 +216,15 @@ impl Server {
 
     fn readable(&mut self, event_loop: &mut EventLoop<Server>, token: Token) -> io::Result<()> {
         debug!("server conn readable; token={:?}", token);
-        let message = try!(self.find_connection_by_token(token).readable());
+        let conncection  = self.find_connection_by_token(token);
+        let message = try!(conncection.readable());
 
         if message.remaining() == message.capacity() { // is_empty
             return Ok(());
         }
+        let conncection2  = conncection.clone();
+;
+        self.tree.insert("test".to_string(),vec![conncection2]);
 
         // TODO pipeine this whole thing
         let mut bad_tokens = Vec::new();
@@ -214,6 +233,7 @@ impl Server {
         for conn in self.conns.iter_mut() {
             // TODO: use references so we don't have to clone
             let conn_send_buf = ByteBuf::from_slice(message.bytes());
+            debug!("{:?}",std::str::from_utf8(message.bytes()).unwrap().to_string());
             if token != conn.token {
                 conn.send_message(conn_send_buf)
                     .and_then(|_| conn.reregister(event_loop))
@@ -243,8 +263,8 @@ impl Server {
     }
 
     /// Find a connection in the slab using the given token.
-    fn find_connection_by_token<'a>(&'a mut self, token: Token) -> &'a mut Connection {
-        &mut self.conns[token]
+    fn find_connection_by_token(&mut self, token: Token) -> Option<Rc<Connection>> {
+        self.conns.get(token)
     }
 }
 
