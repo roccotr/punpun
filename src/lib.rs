@@ -1,9 +1,9 @@
 
 #[macro_use]
-extern crate bitflags;
-extern crate byteorder;
-extern crate rand;
-extern crate openssl;
+extern crate log;
+extern crate env_logger;
+extern crate mio;
+extern crate rustc_serialize;
 
 pub mod engne;
 pub mod hlprs;

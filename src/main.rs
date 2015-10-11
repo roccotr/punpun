@@ -3,44 +3,25 @@
 extern crate log;
 extern crate fern;
 extern crate time;
+extern crate punpun;
 
-extern crate mio;
-extern crate rmp;
-extern crate rmp_serialize;
-extern crate rustc_serialize;
+use punpun::engne::server::{start_server};
+
+
 use std::collections::BTreeMap;
 
 use log::*;
 
 use std::io;
-use std::io::{Error, ErrorKind};
-use std::net::SocketAddr;
-use std::str::FromStr;
-
-use mio::*;
-use mio::buf::ByteBuf;
-use mio::tcp::*;
-use mio::util::Slab;
-
-use rustc_serialize::{Encodable,Decodable};
-use rmp_serialize::{Encoder,Decoder};
-
-use std::rc::Rc;
 
 
 
-#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
-struct Message {
-    action: String,
-    channel: String,
-    message: String,
-    time: String,
-}
+
 
 const HOST: &'static str = "0.0.0.0:10001";
 const LOG_LEVEL: log::LogLevelFilter = log::LogLevelFilter::Debug;
 const LOG_FILE_NAME: &'static str = "/Users/sommoyogurt/workspace/rust/punpun/logs/debug.log";
-const SERVER: Token = Token(1);
+
 
 
 fn init_logger() -> std::io::Result<()> {
@@ -59,316 +40,19 @@ fn init_logger() -> std::io::Result<()> {
 }
 
 
-fn start_server() {
 
-    let addr: SocketAddr = FromStr::from_str(HOST)
-        .ok().expect("Failed to parse host:port string");
-    let sock = TcpListener::bind(&addr).ok().expect("Failed to bind address");
-
-    let mut event_loop = EventLoop::new().ok().expect("Failed to create event loop");
-
-    let mut server = Server::new(sock);
-    server.register(&mut event_loop).ok().expect("Failed to register server with event loop");
-
-    info!("Even loop starting...");
-    event_loop.run(&mut server).ok().expect("Failed to start event loop");
-}
 
 fn main() {
     match init_logger(){
         Ok(s) => info!("Logger init"),
         Err(e) => error!("Error init logger")
     }
-    start_server();
+    start_server(HOST);
 }
 
 
-struct Server {
-    sock: TcpListener,
-    token: Token,
-    conns: Slab<Rc<Connection>>,
-    tree: BTreeMap<String,Vec<Rc<Connection>>>,
-}
 
-impl Handler for Server {
-    type Timeout = ();
-    type Message = ();
 
-    fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
-        debug!("events = {:?}", events);
-        assert!(token != Token(0), "[BUG]: Received event for Token(0)");
-
-        if events.is_error() {
-            warn!("Error event for {:?}", token);
-            self.reset_connection(event_loop, token);
-            return;
-        }
-
-        if events.is_hup() {
-            trace!("Hup event for {:?}", token);
-            self.reset_connection(event_loop, token);
-            return;
-        }
-
-        if events.is_writable() {
-            trace!("Write event for {:?}", token);
-            assert!(self.token != token, "Received writable event for Server");
-
-            self.find_connection_by_token(token).unwrap().writable()
-                .and_then(|_| self.find_connection_by_token(token).reregister(event_loop))
-                .unwrap_or_else(|e| {
-                    warn!("Write event failed for {:?}, {:?}", token, e);
-                    self.reset_connection(event_loop, token);
-                });
-        }
-        if events.is_readable() {
-            trace!("Read event for {:?}", token);
-            if self.token == token {
-                self.accept(event_loop);
-            } else {
-
-                self.readable(event_loop, token)
-                    .and_then(|_| self.find_connection_by_token(token).reregister(event_loop))
-                    .unwrap_or_else(|e| {
-                        warn!("Read event failed for {:?}: {:?}", token, e);
-                        self.reset_connection(event_loop, token);
-                    });
-            }
-        }
-    }
-}
-
-impl Server {
-    fn new(sock: TcpListener) -> Server {
-        Server {
-            sock: sock,
-            token: Token(1),
-            conns: Slab::new_starting_at(Token(2), 128),
-            tree: BTreeMap::new()
-        }
-    }
-
-    fn register(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-        event_loop.register_opt(
-            &self.sock,
-            self.token,
-            EventSet::readable(),
-            PollOpt::edge() | PollOpt::oneshot()
-        ).or_else(|e| {
-            error!("Failed to register server {:?}, {:?}", self.token, e);
-            Err(e)
-        })
-    }
-
-    fn reregister(&mut self, event_loop: &mut EventLoop<Server>) {
-        event_loop.reregister(
-            &self.sock,
-            self.token,
-            EventSet::readable(),
-            PollOpt::edge() | PollOpt::oneshot()
-        ).unwrap_or_else(|e| {
-            error!("Failed to reregister server {:?}, {:?}", self.token, e);
-            let server_token = self.token;
-            self.reset_connection(event_loop, server_token);
-        })
-    }
-
-    fn accept(&mut self, event_loop: &mut EventLoop<Server>) {
-        debug!("server accepting new socket");
-
-        let sock = match self.sock.accept() {
-            Ok(s) => {
-                match s {
-                    Some(sock) => sock,
-                    None => {
-                        error!("Failed to accept new socket");
-                        self.reregister(event_loop);
-                        return;
-                    }
-                }
-            },
-            Err(e) => {
-                error!("Failed to accept new socket, {:?}", e);
-                self.reregister(event_loop);
-                return;
-            }
-        };
-
-        match self.conns.insert_with(|token| {
-            debug!("registering {:?} with event loop", token);
-            Rc::new(Connection::new(sock, token))
-        }) {
-            Some(token) => {
-                match self.find_connection_by_token(token).register(event_loop) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        error!("Failed to register {:?} connection with event loop, {:?}", token, e);
-                        self.conns.remove(token);
-                    }
-                }
-            },
-            None => {
-                error!("Failed to insert connection into slab");
-            }
-        };
-        self.reregister(event_loop);
-    }
-
-    fn readable(&mut self, event_loop: &mut EventLoop<Server>, token: Token) -> io::Result<()> {
-        debug!("server conn readable; token={:?}", token);
-        let conncection  = self.find_connection_by_token(token);
-        let message = try!(conncection.readable());
-
-        if message.remaining() == message.capacity() { // is_empty
-            return Ok(());
-        }
-        let conncection2  = conncection.clone();
-;
-        self.tree.insert("test".to_string(),vec![conncection2]);
-
-        // TODO pipeine this whole thing
-        let mut bad_tokens = Vec::new();
-
-        // Queue up a write for all connected clients.
-        for conn in self.conns.iter_mut() {
-            // TODO: use references so we don't have to clone
-            let conn_send_buf = ByteBuf::from_slice(message.bytes());
-            debug!("{:?}",std::str::from_utf8(message.bytes()).unwrap().to_string());
-            if token != conn.token {
-                conn.send_message(conn_send_buf)
-                    .and_then(|_| conn.reregister(event_loop))
-                    .unwrap_or_else(|e| {
-                        error!("Failed to queue message for {:?}: {:?}", conn.token, e);
-                        // We have a mutable borrow for the connection, so we cannot remove until the
-                        // loop is finished
-                        bad_tokens.push(conn.token)
-                    });
-            }
-        }
-
-        for t in bad_tokens {
-            self.reset_connection(event_loop, t);
-        }
-
-        Ok(())
-    }
-
-    fn reset_connection(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-        if self.token == token {
-            event_loop.shutdown();
-        } else {
-            debug!("reset connection; token={:?}", token);
-            self.conns.remove(token);
-        }
-    }
-
-    /// Find a connection in the slab using the given token.
-    fn find_connection_by_token(&mut self, token: Token) -> Option<Rc<Connection>> {
-        self.conns.get(token)
-    }
-}
-
-struct Connection {
-    sock: TcpStream,
-    token: Token,
-    interest: EventSet,
-    send_queue: Vec<ByteBuf>,
-}
-
-impl Connection {
-    fn new(sock: TcpStream, token: Token) -> Connection {
-        Connection {
-            sock: sock,
-            token: token,
-            interest: EventSet::hup(),
-            send_queue: Vec::new(),
-        }
-    }
-
-    fn readable(&mut self) -> io::Result<ByteBuf> {
-        let mut recv_buf = ByteBuf::mut_with_capacity(2048);
-        loop {
-            match self.sock.try_read_buf(&mut recv_buf) {
-                Ok(None) => {
-                    debug!("CONN : we read 0 bytes");
-                    break;
-                },
-                Ok(Some(n)) => {
-                    debug!("CONN : we read {} bytes", n);
-                    if n < recv_buf.capacity() {
-                        break;
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read buffer for token {:?}, error: {}", self.token, e);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(recv_buf.flip())
-    }
-
-    fn writable(&mut self) -> io::Result<()> {
-
-        try!(self.send_queue.pop()
-            .ok_or(Error::new(ErrorKind::Other, "Could not pop send queue"))
-            .and_then(|mut buf| {
-                match self.sock.try_write_buf(&mut buf) {
-                    Ok(None) => {
-                        debug!("client flushing buf; WouldBlock");
-                        self.send_queue.push(buf);
-                        Ok(())
-                    },
-                    Ok(Some(n)) => {
-                        debug!("CONN : we wrote {} bytes", n);
-                        Ok(())
-                    },
-                    Err(e) => {
-                        error!("Failed to send buffer for {:?}, error: {}", self.token, e);
-                        Err(e)
-                    }
-                }
-            })
-        );
-
-        if self.send_queue.is_empty() {
-            self.interest.remove(EventSet::writable());
-        }
-
-        Ok(())
-    }
-
-    fn send_message(&mut self, message: ByteBuf) -> io::Result<()> {
-        self.send_queue.push(message);
-        self.interest.insert(EventSet::writable());
-        Ok(())
-    }
-    fn register(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-        self.interest.insert(EventSet::readable());
-
-        event_loop.register_opt(
-            &self.sock,
-            self.token,
-            self.interest,
-            PollOpt::edge() | PollOpt::oneshot()
-        ).or_else(|e| {
-            error!("Failed to reregister {:?}, {:?}", self.token, e);
-            Err(e)
-        })
-    }
-
-    fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-        event_loop.reregister(
-            &self.sock,
-            self.token,
-            self.interest,
-            PollOpt::edge() | PollOpt::oneshot()
-        ).or_else(|e| {
-            error!("Failed to reregister {:?}, {:?}", self.token, e);
-            Err(e)
-        })
-    }
-}
 
 #[cfg(test)]
 mod Test {

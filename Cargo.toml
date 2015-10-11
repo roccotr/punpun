@@ -5,9 +5,7 @@ authors = ["sommoyogurt <rtrombetta@gmail.com>"]
 
 
 [dependencies]
-#http-muncher = "0.2.0"
 rustc-serialize = "0.3.15"
-#sha1 = "0.1.1"
 log = "0.3"
 env_logger = "0.3"
 mio = "0.4.3"
@@ -15,13 +13,9 @@ bitflags = "*"
 byteorder = "*"
 rand = "*"
 openssl = "*"
-#slab = "*"
 fern = "*"
 time = "*"
-rmp = "0.7.0"
-rmp-serialize = "0.7.0"
 bytes = "0.2.11"
-zmq = { git = "https://github.com/erickt/rust-zmq.git" }
 
 [dependencies.redis]
 version = "*"
