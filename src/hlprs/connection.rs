@@ -12,13 +12,13 @@ use mio::tcp::*;
 
 pub struct Connection {
     sock: TcpStream,
-    token: Token,
+    pub token: Token,
     interest: EventSet,
     send_queue: Vec<ByteBuf>,
 }
 
 impl Connection {
-    fn new(sock: TcpStream, token: Token) -> Connection {
+    pub fn new(sock: TcpStream, token: Token) -> Connection {
         Connection {
             sock: sock,
             token: token,
@@ -27,7 +27,7 @@ impl Connection {
         }
     }
 
-    fn readable(&mut self) -> Result<ByteBuf> {
+    pub fn readable(&mut self) -> Result<ByteBuf> {
         let mut recv_buf = ByteBuf::mut_with_capacity(2048);
         loop {
             match self.sock.try_read_buf(&mut recv_buf) {
@@ -50,7 +50,7 @@ impl Connection {
         Ok(recv_buf.flip())
     }
 
-    fn writable(&mut self) -> Result<()> {
+    pub fn writable(&mut self) -> Result<()> {
 
         try!(self.send_queue.pop()
             .ok_or(Error::new(ErrorKind::Other, "Could not pop send queue"))
@@ -80,12 +80,12 @@ impl Connection {
         Ok(())
     }
 
-    fn send_message(&mut self, message: ByteBuf) -> Result<()> {
+    pub fn send_message(&mut self, message: ByteBuf) -> Result<()> {
         self.send_queue.push(message);
         self.interest.insert(EventSet::writable());
         Ok(())
     }
-    fn register(&mut self, event_loop: &mut EventLoop<Server>) -> Result<()> {
+    pub fn register(&mut self, event_loop: &mut EventLoop<Server>) -> Result<()> {
         self.interest.insert(EventSet::readable());
 
         event_loop.register_opt(
@@ -99,7 +99,7 @@ impl Connection {
         })
     }
 
-    fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> Result<()> {
+    pub fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> Result<()> {
         event_loop.reregister(
             &self.sock,
             self.token,
