@@ -16,21 +16,6 @@ use rustc_serialize::json::{Json};
 pub const SERVER: Token = Token(1);
 
 
-pub fn start_server(host: &str) {
-
-    let addr: SocketAddr = FromStr::from_str(host)
-        .ok().expect("Failed to parse host:port string");
-    let sock = TcpListener::bind(&addr).ok().expect("Failed to bind address");
-
-    let mut event_loop = EventLoop::new().ok().expect("Failed to create event loop");
-
-    let mut server = Server::new(sock);
-    server.register(&mut event_loop).ok().expect("Failed to register server with event loop");
-
-    info!("Even loop starting...");
-    event_loop.run(&mut server).ok().expect("Failed to start event loop");
-}
-
 pub struct Server {
     sock: TcpListener,
     token: Token,
@@ -94,6 +79,20 @@ impl Server {
             conns: Slab::new_starting_at(Token(2), 128),
             tree: BTreeMap::new()
         }
+    }
+
+    fn run(host: &str){
+        let addr: SocketAddr = FromStr::from_str(host)
+            .ok().expect("Failed to parse host:port string");
+        let sock = TcpListener::bind(&addr).ok().expect("Failed to bind address");
+
+        let mut event_loop = EventLoop::new().ok().expect("Failed to create event loop");
+
+        let mut server = Server::new(sock);
+        server.register(&mut event_loop).ok().expect("Failed to register server with event loop");
+
+        info!("Even loop starting...");
+        event_loop.run(&mut server).ok().expect("Failed to start event loop");
     }
 
     fn register(&mut self, event_loop: &mut EventLoop<Server>) -> Result<()> {

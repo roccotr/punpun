@@ -47,7 +47,7 @@ fn main() {
         Ok(s) => info!("Logger init"),
         Err(e) => error!("Error init logger")
     }
-    start_server(HOST);
+    Server::run(HOST);
 }
 
 
